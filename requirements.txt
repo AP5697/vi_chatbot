@@ -1,0 +1,6 @@
+# VI Telecom Sales Copilot
+pandas>=2.0
+openpyxl>=3.1
+streamlit>=1.30
+google-genai>=0.3
+python-dotenv>=1.0

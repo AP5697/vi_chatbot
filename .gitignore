@@ -1,0 +1,15 @@
+# Secrets — never commit your API key
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Excel lock/temp files
+~$*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
