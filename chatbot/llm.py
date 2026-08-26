@@ -62,8 +62,33 @@ TRANSIENT_MARKERS = (
 )
 
 
+def _get_setting(name: str) -> str | None:
+    """
+    Look up a config value from the environment, falling back to Streamlit's
+    secrets store.
+
+    Streamlit Cloud injects values from secrets.toml into `st.secrets`, but
+    NOT reliably into `os.environ` across all Streamlit versions -- so relying
+    on os.getenv() alone can silently fail after a deploy even though the
+    secret is set correctly in the dashboard. Checking st.secrets explicitly
+    makes this work regardless of that version behaviour.
+
+    Safe to call outside Streamlit (e.g. from chatbot/eval.py on the CLI):
+    importing streamlit or reading st.secrets with no secrets.toml present
+    both raise, and are simply treated as "not found there".
+    """
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
 def get_api_key() -> str | None:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    return _get_setting("GEMINI_API_KEY") or _get_setting("GOOGLE_API_KEY")
 
 
 def resolve_model_chain() -> list[str]:
@@ -72,7 +97,7 @@ def resolve_model_chain() -> list[str]:
     the defaults follow it as fallbacks (deduplicated, order preserved).
     """
     chain = list(DEFAULT_MODEL_CHAIN)
-    preferred = os.getenv("GEMINI_MODEL", "").strip()
+    preferred = (_get_setting("GEMINI_MODEL") or "").strip()
     if preferred:
         chain = [preferred] + [m for m in chain if m != preferred]
     return chain
@@ -123,7 +148,8 @@ class GeminiCopilot:
 
     def __init__(self, system_instruction: str, model: str | None = None,
                  api_key: str | None = None, temperature: float = 0.2,
-                 max_total_seconds: float = MAX_TOTAL_SECONDS):
+                 max_total_seconds: float = MAX_TOTAL_SECONDS,
+                 valid_plan_ids: set[str] | None = None, guardrails: bool = True):
         try:
             from google import genai
             from google.genai import types
@@ -142,7 +168,18 @@ class GeminiCopilot:
             )
 
         self._types = types
-        self._client = genai.Client(api_key=key)
+        # Disable the SDK's OWN retry loop (default: several tenacity retries on
+        # 503, ~30s per call). We run our own multi-MODEL fallback chain, so a
+        # single model must fail FAST -- otherwise the SDK's internal retries eat
+        # the whole time budget on model #1 and we never reach the fallbacks.
+        try:
+            http_options = types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=1)
+            )
+            self._client = genai.Client(api_key=key, http_options=http_options)
+        except Exception:
+            # Older SDK without retry_options: fall back to default client.
+            self._client = genai.Client(api_key=key)
         self._chain = [model] + [m for m in resolve_model_chain() if m != model] \
             if model else resolve_model_chain()
         self._config = types.GenerateContentConfig(
@@ -150,6 +187,8 @@ class GeminiCopilot:
             temperature=temperature,
         )
         self._max_total_seconds = max_total_seconds
+        self._guardrails = guardrails
+        self._valid_plan_ids = valid_plan_ids or set()
         # The model that answered most recently, so the UI can show it.
         self.active_model = self._chain[0]
 
@@ -169,6 +208,29 @@ class GeminiCopilot:
         return contents
 
     def reply(self, history: list[dict]) -> str:
+        """
+        Answer the conversation, with guardrails when enabled.
+
+        Input guard runs first: a jailbreak / prompt-injection attempt is
+        refused WITHOUT calling the API (saving a request). Otherwise the model
+        answers, and the output is fact-checked (cited plan codes must exist)
+        before being returned.
+        """
+        if not self._guardrails:
+            return self._generate(history)
+
+        from . import guardrails as gr
+
+        question = next(
+            (m["content"] for m in reversed(history) if m["role"] == "user"), ""
+        )
+        refusal = gr.check_input(question)
+        if refusal:
+            return refusal
+        answer = self._generate(history)
+        return gr.verify_output(answer, self._valid_plan_ids)
+
+    def _generate(self, history: list[dict]) -> str:
         """
         Send the conversation and return the answer text.
 

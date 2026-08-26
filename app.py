@@ -50,18 +50,33 @@ SUGGESTED_QUESTIONS = [
 ]
 
 
+RULES_MODE = "Rule-based (no LLM)"
+LLM_MODE = "Gemini-powered"
+
+
 @st.cache_resource(show_spinner="Loading VI plan catalogue…")
-def load_copilot():
-    """Load the dataset once and build the grounded Gemini client (cached)."""
+def load_gemini_copilot():
+    """Dataset + grounded Gemini client (with guardrails). Needs an API key."""
     records, grounding, facts = get_catalog()
     system_instruction = build_system_instruction(grounding, facts)
-    copilot = GeminiCopilot(system_instruction=system_instruction)
+    valid_ids = {str(r.get("Plan_SOC_ID")) for r in records}
+    copilot = GeminiCopilot(system_instruction=system_instruction,
+                            valid_plan_ids=valid_ids)
     return copilot, facts, len(records)
 
 
-def render_sidebar(copilot, facts: dict, plan_count: int):
+@st.cache_resource(show_spinner="Loading VI plan catalogue…")
+def load_rules_engine():
+    """Dataset + deterministic engine. No API key, no network, no quota."""
+    from chatbot.catalog import load_dataframe, dataset_facts
+    from chatbot.rules_engine import RulesEngine
+
+    df = load_dataframe()
+    return RulesEngine(df), dataset_facts(df), len(df)
+
+
+def render_sidebar(copilot, facts: dict, plan_count: int, mode: str):
     with st.sidebar:
-        st.header("📶 VI Sales Copilot")
         st.caption("Grounded on the authoritative VI plan dataset. "
                    "Answers come only from the loaded catalogue — no guessing.")
         st.divider()
@@ -70,44 +85,73 @@ def render_sidebar(copilot, facts: dict, plan_count: int):
             st.metric("Price range", f"₹{facts['min_price']} – ₹{facts['max_price']}")
         st.caption("**Plan types:** " + ", ".join(facts.get("plan_types", [])))
         st.divider()
-        st.caption(f"Model: `{copilot.active_model}`")
-        with st.expander("Fallback chain"):
+
+        if mode == RULES_MODE:
+            st.caption("Engine: `rule-based` — offline, no API key, no quota.")
             st.caption(
-                "Free-tier quota is counted per model per day, so if one runs "
-                "out the app automatically moves to the next:"
+                "Answers come from direct lookups on the dataset, so nothing can "
+                "be invented. Free-form questions may need concrete criteria "
+                "(a plan code/name, or a price / data / validity / 5G / OTT filter)."
             )
-            for i, m in enumerate(copilot.model_chain, start=1):
-                st.caption(f"{i}. `{m}`")
+        else:
+            st.caption(f"Model: `{copilot.active_model}`")
+            with st.expander("Fallback chain"):
+                st.caption(
+                    "Free-tier quota is counted per model per day, so if one runs "
+                    "out the app automatically moves to the next:"
+                )
+                for i, m in enumerate(copilot.model_chain, start=1):
+                    st.caption(f"{i}. `{m}`")
+
         if st.button("🗑️ Clear conversation", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
 
 
 def main():
-    # --- API key gate -------------------------------------------------------
-    if not get_api_key():
+    # --- Engine mode --------------------------------------------------------
+    # Default to rule-based when there's no key, so the app is always usable.
+    has_key = bool(get_api_key())
+    if "mode" not in st.session_state:
+        st.session_state.mode = LLM_MODE if has_key else RULES_MODE
+
+    with st.sidebar:
+        st.header("📶 VI Sales Copilot")
+        st.radio(
+            "Answer engine",
+            [RULES_MODE, LLM_MODE],
+            key="mode",
+            help="Rule-based runs entirely offline with no API key or quota. "
+                 "Gemini handles free-form phrasing but needs a key.",
+        )
+    mode = st.session_state.mode
+
+    if mode == LLM_MODE and not has_key:
         st.title("📶 VI Telecom Sales Copilot")
-        st.error("No Gemini API key found.")
+        st.error("No Gemini API key found — switch to **Rule-based (no LLM)** in the "
+                 "sidebar to use the app without a key.")
         st.markdown(
-            "Set **`GEMINI_API_KEY`** (or `GOOGLE_API_KEY`) before launching.\n\n"
-            "1. Get a free key at https://aistudio.google.com/apikey\n"
-            "2. Copy `.env.example` to `.env` and paste your key, **or** set it in your shell:\n"
-            "   ```bash\n   set GEMINI_API_KEY='your_key_here'   # Windows (cmd)\n   ```\n"
-            "3. Re-run `streamlit run app.py`."
+            "To use Gemini mode, set **`GEMINI_API_KEY`**:\n\n"
+            "- **Locally:** copy `.env.example` to `.env` and paste your key\n"
+            "- **Streamlit Cloud:** app Settings → Secrets → `GEMINI_API_KEY = \"...\"`\n\n"
+            "Get a free key at https://aistudio.google.com/apikey"
         )
         st.stop()
 
-    # --- Load dataset + model ----------------------------------------------
+    # --- Load dataset + engine ----------------------------------------------
     try:
-        copilot, facts, plan_count = load_copilot()
+        if mode == RULES_MODE:
+            copilot, facts, plan_count = load_rules_engine()
+        else:
+            copilot, facts, plan_count = load_gemini_copilot()
     except FileNotFoundError as exc:
         st.title("📶 VI Telecom Sales Copilot")
         st.error(str(exc))
-        st.info("Run `python segregate_telecom_data.py` to generate the workbook, then reload.")
+        st.info("Run `python build_wide_dataset.py` to generate the dataset, then reload.")
         st.stop()
         return
 
-    render_sidebar(copilot, facts, plan_count)
+    render_sidebar(copilot, facts, plan_count, mode)
 
     st.title("📶 VI Telecom Sales & Customer-Care Copilot")
     st.caption("Ask anything about the VI plans — you'll get a direct, to-the-point answer from the dataset.")
@@ -152,6 +196,7 @@ def main():
                         "requests per model per day, and every model in the fallback "
                         "chain is now spent.\n\n"
                         "You can:\n"
+                        "- switch to **Rule-based (no LLM)** in the sidebar — no quota at all, or\n"
                         "- wait for the quota to reset (it resets daily), or\n"
                         "- enable billing on your key at https://aistudio.google.com/apikey\n\n"
                         "Nothing is wrong with the app or the dataset."
