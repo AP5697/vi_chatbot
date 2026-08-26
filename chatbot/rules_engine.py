@@ -153,6 +153,11 @@ def _rupees(value) -> str:
     return f"₹{int(n)}" if n is not None and n == int(n) else f"₹{value}"
 
 
+def _days_text(value) -> str:
+    """'1 day' / '28 days' -- the catalogue has genuine 1-day booster packs."""
+    return f"{value} day" if _num(value) == 1 else f"{value} days"
+
+
 # --------------------------------------------------------------------------
 # Question parsing
 # --------------------------------------------------------------------------
@@ -312,16 +317,42 @@ def _plan_label(row: pd.Series) -> str:
     return f"**{row['Plan_Name']}** ({row['Plan_SOC_ID']})"
 
 
+def _format_cell(column: str, value) -> str:
+    """
+    Display formatting for the columns the CSV stores as bare numbers.
+
+    Total_Data_Limit is the one that actually misleads: shown raw it reads as
+    "Total data: 84", which a rep could take for days or rupees rather than GB.
+    Every other column already carries its own unit in the data.
+    """
+    if column == "Plan_Rental":
+        return _rupees(value)
+    if column == "Validity_Days":
+        return _days_text(value)
+    if column == "Total_Data_Limit" and _num(value) is not None:
+        return f"{value} GB"
+    return str(value)
+
+
+def _table_cell(column: str, value) -> str:
+    """
+    Markdown-table-safe version of _format_cell.
+
+    Several dataset columns legitimately contain a '|' as a separator --
+    "Bundled OTT Subscriptions | Vi Movies & TV Access", "Retail Outlet | Cash",
+    the GST breakdown, all the Tagging_* fields. Dropped into a Markdown table
+    raw, that pipe opens a phantom column and silently shifts every value after
+    it, so the rep reads the wrong plan's benefit. Escaping keeps the cell
+    intact and still displays as a plain '|'.
+    """
+    return _format_cell(column, value).replace("|", "\\|")
+
+
 def render_field(rows: pd.DataFrame, column: str, label: str) -> str:
-    lines = []
-    for _, r in rows.iterrows():
-        value = r[column]
-        if column == "Plan_Rental":
-            value = _rupees(value)
-        elif column == "Validity_Days":
-            value = f"{value} days"
-        lines.append(f"{_plan_label(r)} — {label}: {value}")
-    return "\n\n".join(lines)
+    return "\n\n".join(
+        f"{_plan_label(r)} — {label}: {_format_cell(column, r[column])}"
+        for _, r in rows.iterrows()
+    )
 
 
 def render_details(row: pd.Series) -> str:
@@ -329,23 +360,18 @@ def render_details(row: pd.Series) -> str:
     for column, label in DETAIL_FIELDS:
         if column not in row.index:
             continue
-        value = row[column]
-        if column == "Plan_Rental":
-            value = _rupees(value)
-        elif column == "Validity_Days":
-            value = f"{value} days"
-        lines.append(f"- **{label}:** {value}")
+        lines.append(f"- **{label}:** {_format_cell(column, row[column])}")
     return "\n".join(lines)
 
 
 def render_table(rows: pd.DataFrame, limit: int = 25) -> str:
     shown = rows.head(limit)
+    columns = ["Plan_Name", "Plan_SOC_ID", "Plan_Rental", "Validity_Days",
+               "Daily_Data_Limit", "Voice_Benefit", "5G_Eligible", "OTT_Platform"]
     header = "| Plan | Code | Price | Validity | Data | Voice | 5G | OTT |"
     sep = "| --- | --- | ---: | ---: | --- | --- | --- | --- |"
     body = [
-        f"| {r['Plan_Name']} | {r['Plan_SOC_ID']} | {_rupees(r['Plan_Rental'])} | "
-        f"{r['Validity_Days']}d | {r['Daily_Data_Limit']} | {r['Voice_Benefit']} | "
-        f"{r['5G_Eligible']} | {r['OTT_Platform']} |"
+        "| " + " | ".join(_table_cell(c, r[c]) for c in columns) + " |"
         for _, r in shown.iterrows()
     ]
     table = "\n".join([header, sep] + body)
@@ -461,22 +487,142 @@ def recommend_for_profile(key: str, df: pd.DataFrame, k: int = 3) -> pd.DataFram
     return pool.head(k)
 
 
+# --------------------------------------------------------------------------
+# Guided plan finder
+#
+# Backs the "Plan Finder" questionnaire in the UI: instead of the rep having to
+# phrase a query, they answer a few fixed questions and we resolve them against
+# the dataset. Same guarantee as the rest of this module -- every result is a
+# real row, so nothing can be invented.
+# --------------------------------------------------------------------------
+
+# Must-have key -> (human label, predicate on a plan row).
+# Note on roaming: nearly every plan carries free NATIONAL roaming, so treating
+# "roaming" as a requirement would filter almost nothing. The one that actually
+# narrows the catalogue -- and the one a rep is asked for -- is international.
+QUIZ_NEEDS: dict[str, tuple[str, object]] = {
+    "5g": ("5G ready",
+           lambda r: str(r["5G_Eligible"]).strip().lower() == "yes"),
+    "ott": ("OTT bundled",
+            lambda r: not _is_negative(r["OTT_Platform"])),
+    "voice": ("Unlimited calling",
+              lambda r: "unlimited" in str(r["Voice_Benefit"]).lower()),
+    "roaming": ("International roaming",
+                lambda r: "international" in str(r["Roaming_Benefit"]).lower()
+                or "ir " in str(r["Roaming_Benefit"]).lower()),
+    "rollover": ("Data rollover",
+                 lambda r: str(r["Data_Rollover"]).strip().lower() == "yes"),
+}
+
+
+def find_best_plans(prefs: dict, df: pd.DataFrame, k: int = 3) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Rank live plans against a filled-in Plan Finder questionnaire.
+
+    Constraints are dropped one at a time when nothing survives, so the rep
+    always gets a usable answer PLUS an explicit note about which requirement
+    had to give -- better than an empty result with no explanation. They are
+    relaxed least-important first, which puts budget last: a customer's price
+    ceiling is usually the hardest of their constraints, so it is the one we
+    break only as a final resort.
+
+    Ranking is "the cheapest plan that still qualifies", tie-broken by more
+    daily data then longer validity. That is a sales rule a human can audit,
+    not an opaque score.
+
+    prefs keys (all optional): max_price, min_daily_gb, min_days, max_days,
+    product_type, needs (list of QUIZ_NEEDS keys).
+
+    Returns (rows, relaxed) -- `relaxed` names the constraints that were
+    dropped, in the order they were dropped.
+    """
+    pool = df[df["Plan_Status"].str.lower() == "live"]
+
+    product_type = (prefs.get("product_type") or "").strip().lower()
+    if product_type:
+        typed = pool[pool["Product_Type"].str.lower() == product_type]
+        if not typed.empty:
+            pool = typed
+
+    # Ordered LEAST important first -- this is the drop order.
+    constraints: list[tuple[str, object]] = []
+
+    if prefs.get("max_days"):
+        v = float(prefs["max_days"])
+        constraints.append((f"validity up to {int(v)} days",
+                            lambda r, v=v: (_num(r["Validity_Days"]) or 0) <= v))
+    if prefs.get("min_days"):
+        v = float(prefs["min_days"])
+        constraints.append((f"validity of {int(v)}+ days",
+                            lambda r, v=v: (_num(r["Validity_Days"]) or 0) >= v))
+    if prefs.get("min_daily_gb"):
+        v = float(prefs["min_daily_gb"])
+        constraints.append((f"at least {v:g} GB/day",
+                            lambda r, v=v: (_daily_gb(r["Daily_Data_Limit"]) or 0) >= v))
+    for key in prefs.get("needs") or []:
+        if key in QUIZ_NEEDS:
+            constraints.append(QUIZ_NEEDS[key])
+    if prefs.get("max_price"):
+        v = float(prefs["max_price"])
+        constraints.append((f"budget under ₹{int(v)}",
+                            lambda r, v=v: (_num(r["Plan_Rental"]) or 0) <= v))
+
+    relaxed: list[str] = []
+    active = list(constraints)
+    while True:
+        rows = pool
+        for _, predicate in active:
+            if rows.empty:
+                break
+            rows = rows[rows.apply(predicate, axis=1)]
+        if not rows.empty or not active:
+            break
+        relaxed.append(active.pop(0)[0])
+
+    if rows.empty:
+        return rows, relaxed
+
+    ranked = rows.assign(
+        _price=rows["Plan_Rental"].apply(lambda v: _num(v) if _num(v) is not None else 0.0),
+        _gb=rows["Daily_Data_Limit"].apply(lambda v: _daily_gb(v) or 0.0),
+        _days=rows["Validity_Days"].apply(lambda v: _num(v) or 0.0),
+    ).sort_values(["_price", "_gb", "_days"], ascending=[True, False, False])
+    return ranked.drop(columns=["_price", "_gb", "_days"]).head(k), relaxed
+
+
+def explain_pick(row: pd.Series, prefs: dict) -> list[str]:
+    """
+    Short bullet reasons this plan was picked, drawn straight from its row.
+    Used under each Plan Finder result so the rep can justify the pitch.
+    """
+    reasons = [
+        f"{_rupees(row['Plan_Rental'])} for {_days_text(row['Validity_Days'])}",
+        f"Data: {row['Daily_Data_Limit']}",
+        f"Voice: {row['Voice_Benefit']}",
+    ]
+    for key in prefs.get("needs") or []:
+        if key in QUIZ_NEEDS:
+            label, predicate = QUIZ_NEEDS[key]
+            if predicate(row):
+                detail = {
+                    "ott": row["OTT_Platform"],
+                    "roaming": row["Roaming_Benefit"],
+                }.get(key)
+                reasons.append(f"{label}" + (f" — {detail}" if detail else " ✓"))
+    return reasons
+
+
 def render_comparison(rows: pd.DataFrame) -> str:
     plans = [rows.iloc[i] for i in range(min(len(rows), 4))]
-    header = "| Feature | " + " | ".join(p["Plan_Name"] for p in plans) + " |"
+    header = ("| Feature | "
+              + " | ".join(_table_cell("Plan_Name", p["Plan_Name"]) for p in plans)
+              + " |")
     sep = "| --- |" + " --- |" * len(plans)
     lines = [header, sep]
     for column, label in DETAIL_FIELDS:
         if column == "Plan_SOC_ID":
             continue
-        values = []
-        for p in plans:
-            v = p[column]
-            if column == "Plan_Rental":
-                v = _rupees(v)
-            elif column == "Validity_Days":
-                v = f"{v} days"
-            values.append(str(v))
+        values = [_table_cell(column, p[column]) for p in plans]
         if len(set(values)) == 1 and column not in ("Plan_Rental", "Validity_Days"):
             continue  # skip rows where every plan is identical
         lines.append(f"| {label} | " + " | ".join(values) + " |")

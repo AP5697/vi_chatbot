@@ -18,7 +18,9 @@ import re
 import sys
 
 from .catalog import load_dataframe
-from .rules_engine import RulesEngine
+from .rules_engine import (RulesEngine, _daily_gb, _is_negative, _num,
+                           _table_cell, explain_pick, find_best_plans,
+                           render_comparison, render_table)
 
 
 class Case:
@@ -71,6 +73,10 @@ def build_cases(df) -> list[Case]:
         Case(f"complete details of plan {pid}",
              contains=["Vi Hero Unlimited 449", "Price", "Validity", "Voice"],
              label="full details card"),
+        # The CSV stores Total_Data_Limit unitless ("84"), which reads as days
+        # or rupees unless the renderer adds GB.
+        Case(f"total data on plan {pid}", contains=["84 GB"],
+             label="total data carries its GB unit"),
 
         # --- filtered search ---
         Case("plans under 500 with unlimited voice",
@@ -145,6 +151,165 @@ def build_cases(df) -> list[Case]:
     ]
 
 
+# --------------------------------------------------------------------------
+# Plan Finder (find_best_plans) -- a function API rather than a question, so it
+# gets its own small harness: each case is (label, prefs, check) where check
+# returns None on success or a reason string on failure.
+# --------------------------------------------------------------------------
+
+def build_finder_cases() -> list[tuple[str, dict, object]]:
+    def all_rows(rows, predicate, what):
+        bad = [r["Plan_Name"] for _, r in rows.iterrows() if not predicate(r)]
+        return f"{what} violated by: {bad}" if bad else None
+
+    return [
+        ("budget ≤₹200 + unlimited voice",
+         {"max_price": 200, "needs": ["voice"]},
+         lambda rows, relaxed: (
+             "relaxed unexpectedly: " + str(relaxed) if relaxed else
+             all_rows(rows, lambda r: (_num(r["Plan_Rental"]) or 0) <= 200
+                      and "unlimited" in str(r["Voice_Benefit"]).lower(),
+                      "budget/voice"))),
+
+        ("heavy data + 5G + OTT",
+         {"max_price": 700, "min_daily_gb": 2.0, "needs": ["5g", "ott", "voice"]},
+         lambda rows, relaxed: (
+             "relaxed unexpectedly: " + str(relaxed) if relaxed else
+             all_rows(rows, lambda r: str(r["5G_Eligible"]).lower() == "yes"
+                      and (_daily_gb(r["Daily_Data_Limit"]) or 0) >= 2.0
+                      and not _is_negative(r["OTT_Platform"]),
+                      "5G/data/OTT"))),
+
+        ("quarterly validity (84+ days)",
+         {"min_days": 84, "needs": ["voice"]},
+         lambda rows, relaxed: all_rows(
+             rows, lambda r: (_num(r["Validity_Days"]) or 0) >= 84, "min validity")),
+
+        ("monthly validity (≤30 days)",
+         {"max_days": 30, "needs": ["voice"]},
+         lambda rows, relaxed: all_rows(
+             rows, lambda r: (_num(r["Validity_Days"]) or 0) <= 30, "max validity")),
+
+        ("postpaid only",
+         {"product_type": "Postpaid"},
+         lambda rows, relaxed: all_rows(
+             rows, lambda r: r["Product_Type"] == "Postpaid", "product type")),
+
+        ("only live plans are ever offered",
+         {"max_price": 1000},
+         lambda rows, relaxed: all_rows(
+             rows, lambda r: str(r["Plan_Status"]).lower() == "live", "live status")),
+
+        ("cheapest first",
+         {"needs": ["voice"]},
+         lambda rows, relaxed: (
+             None if list(p := [_num(r["Plan_Rental"]) for _, r in rows.iterrows()])
+             == sorted(p) else f"not price-ascending: {p}")),
+
+        # The rep must never be handed an empty result with no explanation.
+        ("impossible ask still returns picks + explains what gave",
+         {"max_price": 50, "min_daily_gb": 3.0,
+          "needs": ["5g", "ott", "roaming", "rollover"]},
+         lambda rows, relaxed: (
+             "returned nothing" if rows.empty else
+             "nothing reported as relaxed" if not relaxed else None)),
+
+        # Budget is the customer's hardest constraint, so it must be the LAST
+        # thing dropped -- never sacrificed while softer asks still stand.
+        ("budget is relaxed last",
+         {"max_price": 50, "min_daily_gb": 3.0, "needs": ["5g", "ott"]},
+         lambda rows, relaxed: (
+             None if not any("budget" in r for r in relaxed)
+             or relaxed[-1].startswith("budget")
+             else f"budget dropped too early: {relaxed}")),
+
+        ("explain_pick cites the satisfied must-haves",
+         {"max_price": 700, "needs": ["5g", "voice"]},
+         lambda rows, relaxed: (
+             "no rows" if rows.empty else
+             None if any("5G" in x for x in explain_pick(rows.iloc[0],
+                                                         {"needs": ["5g", "voice"]}))
+             else "5G not mentioned in reasons")),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Markdown table integrity
+#
+# Nine dataset columns legitimately contain a '|' separator. Unescaped, that
+# opens a phantom column and silently shifts every later value -- so the rep
+# reads one plan's benefit under another plan's name. These check the STRUCTURE
+# (equal cell counts per row) rather than any particular wording.
+# --------------------------------------------------------------------------
+
+def _row_widths(table: str) -> list[int]:
+    """Cell count of each row, treating an escaped \\| as ordinary text."""
+    widths = []
+    for line in table.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        widths.append(len(line.replace("\\|", "\0").strip("|").split("|")))
+    return widths
+
+
+def run_table_tests(df) -> tuple[int, int]:
+    engine = RulesEngine(df)
+
+    # A plan whose Additional_Benefits really does contain a pipe.
+    piped = df[df["Additional_Benefits"].str.contains(r"\|", na=False, regex=True)]
+    two = piped.head(2)
+
+    cases: list[tuple[str, object]] = [
+        ("comparison of pipe-containing plans keeps its shape",
+         lambda: render_comparison(two)),
+        ("plan list keeps its shape", lambda: render_table(df.head(8))),
+        ("comparison of 4 plans keeps its shape",
+         lambda: render_comparison(df.head(4))),
+        ("engine answer for a filtered search keeps its shape",
+         lambda: engine.reply([{"role": "user", "content": "5G plans under 400"}])),
+    ]
+
+    passed = 0
+    print(f"\nMarkdown table integrity ({len(cases) + 1} tests):")
+    for label, produce in cases:
+        widths = _row_widths(produce())
+        ok = len(set(widths)) <= 1
+        passed += ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
+        if not ok:
+            print(f"         ragged rows: {widths}")
+
+    # Escaping must PRESERVE the value, not truncate it at the pipe. Checked on
+    # the escaping unit directly: both segments of a piped benefit must survive,
+    # separated by an ESCAPED pipe (so it renders as text, not a new column).
+    raw = "Bundled OTT Subscriptions | Vi Movies & TV Access"
+    escaped = _table_cell("Additional_Benefits", raw)
+    ok = (escaped == "Bundled OTT Subscriptions \\| Vi Movies & TV Access")
+    passed += ok
+    print(f"  [{'PASS' if ok else 'FAIL'}] escaped pipe preserves the full value")
+    if not ok:
+        print(f"         got {escaped!r}")
+    return passed, len(cases) + 1
+
+
+def run_finder_tests(df) -> tuple[int, int]:
+    cases = build_finder_cases()
+    passed = 0
+    print(f"\nPlan Finder ({len(cases)} tests):")
+    for label, prefs, check in cases:
+        rows, relaxed = find_best_plans(prefs, df)
+        try:
+            reason = check(rows, relaxed)
+        except Exception as exc:               # a raising check is a failure
+            reason = f"raised {type(exc).__name__}: {exc}"
+        passed += reason is None
+        print(f"  [{'PASS' if reason is None else 'FAIL'}] {label}")
+        if reason:
+            print(f"         {reason}")
+    return passed, len(cases)
+
+
 def run() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -165,8 +330,14 @@ def run() -> int:
         if not ok:
             print(f"        {reason}")
 
-    print(f"\nRESULT: {passed}/{len(cases)} passed")
-    return 0 if passed == len(cases) else 1
+    total = len(cases)
+    for suite in (run_table_tests, run_finder_tests):
+        suite_passed, suite_total = suite(df)
+        passed += suite_passed
+        total += suite_total
+
+    print(f"\nRESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
 
 
 if __name__ == "__main__":
