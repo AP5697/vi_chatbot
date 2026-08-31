@@ -202,7 +202,7 @@ def render_sidebar(copilot, facts: dict, plan_count: int, mode: str):
 # Tab: Chat
 # --------------------------------------------------------------------------
 
-def render_chat_tab(copilot):
+def render_chat_tab(copilot, mode: str):
     st.caption("Ask anything about the VI plans — you'll get a direct, "
                "to-the-point answer from the dataset.")
 
@@ -422,7 +422,7 @@ def main():
         ["💬 Chat", "⚖️ Compare plans", "🎯 Plan Finder"]
     )
     with tab_chat:
-        render_chat_tab(copilot)
+        render_chat_tab(copilot, mode)
     with tab_compare:
         render_compare_tab(df)
     with tab_finder:
