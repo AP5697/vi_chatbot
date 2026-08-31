@@ -35,7 +35,10 @@ try:
 except ImportError:
     pass
 
+import time
+
 from chatbot import get_catalog, build_system_instruction, GeminiCopilot, get_api_key
+from chatbot import analytics as al
 from chatbot.export import (comparison_markdown, conversation_markdown,
                             suggested_filename)
 from chatbot.llm import QuotaExhaustedError, ServiceUnavailableError
@@ -232,6 +235,7 @@ def render_chat_tab(copilot):
 
     with st.chat_message("assistant"):
         with st.spinner("Checking the plan catalogue…"):
+            t0 = time.monotonic()
             try:
                 answer = copilot.reply(st.session_state.messages)
             except QuotaExhaustedError:
@@ -259,7 +263,16 @@ def render_chat_tab(copilot):
                 )
             except Exception as exc:  # surface real errors cleanly
                 answer = f"⚠️ Something went wrong talking to the model:\n\n`{exc}`"
+            finally:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
         st.markdown(answer)
+        al.log_event(
+            question=prompt,
+            engine=mode,
+            model=getattr(copilot, "active_model", mode),
+            ms=elapsed_ms,
+            answer=answer,
+        )
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
 

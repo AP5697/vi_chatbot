@@ -23,6 +23,7 @@ SUITES = [
     ("Fallback chain", "chatbot.test_llm"),
     ("Export", "chatbot.test_export"),
     ("Dataset admin", "chatbot.test_dataset_admin"),
+    ("Analytics", "chatbot.test_analytics"),
 ]
 
 

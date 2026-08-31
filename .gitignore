@@ -16,6 +16,9 @@ output/backups/
 # Sample/test datasets (not part of the app, generated locally)
 output/samples/
 
+# Usage analytics log (runtime data, machine-local)
+output/analytics.jsonl
+
 # OS
 .DS_Store
 Thumbs.db
