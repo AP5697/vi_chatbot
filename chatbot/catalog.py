@@ -6,20 +6,9 @@ Loads the clean WIDE dataset (output/vi_plans_wide_dataset.csv) -- one row per
 plan, no blank cells -- and turns it into the grounding block the chatbot
 answers from.
 
-TOKEN EFFICIENCY
-----------------
-The whole catalogue is sent to the model on EVERY question, so its size
-directly drives API quota use. Two things keep it small without losing a single
-fact:
 
-  1. CSV instead of JSON. A list-of-objects repeats all 58 column names for all
-     62 plans; CSV states the header once. (~48% smaller.)
-  2. Constant columns are hoisted out. Ten columns hold the identical value for
-     every plan (Operator, 4G_Eligible, the Activation_* and Tagging_* fields).
-     Repeating them 62 times is pure waste, so they are stated once as
-     "applies to every plan" facts instead.
 
-Together: ~36,000 tokens -> ~13,700 tokens per request, same information.
+
 """
 
 from __future__ import annotations

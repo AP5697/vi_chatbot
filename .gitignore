@@ -10,6 +10,12 @@ venv/
 # Excel lock/temp files
 ~$*.xlsx
 
+# Admin-panel dataset backups (generated at runtime, machine-local)
+output/backups/
+
+# Sample/test datasets (not part of the app, generated locally)
+output/samples/
+
 # OS
 .DS_Store
 Thumbs.db
